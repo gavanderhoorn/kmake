@@ -17,7 +17,7 @@ build all targets in the correct order.
 
 ## Requirements
 
-`rossum` is written in Python 2, so naturally it needs a Python 2 install.
+`rossum` is written in Python 3, so naturally it needs a Python 3 install. 'rossum.cmd' calls python launcher "py -3", so make sure python launcher is installed with your python 3 distribution.
 
 The generated Ninja build files require a recent (> 1.7.1) version of [Ninja][]
 to be present.
