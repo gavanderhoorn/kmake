@@ -441,11 +441,15 @@ def main():
     #
     # Template processing
     #
+    if isversion(robot_ini_info.version) and not args.override_ini:
+        ktrans_version = robot_ini_info.version
+    else:
+        ktrans_version = args.core_version
 
     # populate dicts & lists needed by template
     ktrans = KtransInfo(path=ktrans_path, support=KtransSupportDirInfo(
         path=fr_support_dir,
-        version_string=args.core_version))
+        version_string=ktrans_version))
     ktransw = KtransWInfo(path=ktransw_path)
     bs_info = RossumSpaceInfo(path=build_dir)
     sp_infos = [RossumSpaceInfo(path=p) for p in src_space_dirs]
