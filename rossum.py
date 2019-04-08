@@ -30,6 +30,7 @@ import datetime
 import os
 import sys
 import json
+import configparser
 import fnmatch
 
 import collections
@@ -85,6 +86,17 @@ class InvalidManifestException(Exception):
 
 class MissingPkgDependency(Exception):
     pass
+
+#container for contents of ini file
+robotiniInfo = collections.namedtuple('robotiniInfo',
+    'robot '
+    'version '
+    'base_path ' #base_path designates the base directory where WinOLPC
+                 # or roboguide is installed eg. C:\Program Files (x86)\Fanuc\
+    'version_path ' #version path is where applications for specified version are stored
+                    # eg. C:\Program Files (x86)\Fanuc\WinOLPC\Versions\V910-1\bin
+    'support '
+    'output')
 
 
 KtransSupportDirInfo = collections.namedtuple('KtransSupportDirInfo', 'path version_string')
@@ -189,6 +201,8 @@ def main():
     parser.add_argument('-r', '--robot-ini', type=str, dest='robot_ini',
         metavar='INI', default=ROBOT_INI_NAME,
         help="Location of {0} (default: source dir)".format(ROBOT_INI_NAME))
+    parser.add_argument('-o', '--override', action='store_true', dest='override_ini',
+        help='override robot.ini file directories with specified paths')
     parser.add_argument('-w', '--overwrite', action='store_true', dest='overwrite',
         help='Overwrite any build file that may exist in the build dir')
     parser.add_argument('src_dir', type=str, metavar='SRC',
@@ -245,36 +259,21 @@ def main():
         # TODO: find appropriate exit code
         sys.exit(_OS_EX_DATAERR)
 
+    #find robot.ini file
+    robot_ini_loc = find_robotini(source_dir, args)
 
-    # check we can find a usable robot.ini somewhere.
-    # strategy:
-    #  - if user provided a location, use that
-    #  - if not, try CWD (default value of arg is relative to CWD)
-    #  - if that doesn't work, try source space
+    #parse robot.ini file into collection tuple 'robotiniInfo'
+    robot_ini_info = parse_robotini(robot_ini_loc)
 
-    # because 'args.robot_ini' has a default which is simply 'robot.ini', we
-    # cover the first two cases in the above list with this single statement
-    robot_ini_loc = os.path.abspath(args.robot_ini)
-
-    # check that it actually exists
-    logger.debug("Checking: {}".format(robot_ini_loc))
-    if not os.path.exists(robot_ini_loc):
-        logger.warn("No {} in CWD, and no alternative provided, trying "
-            "source space".format(ROBOT_INI_NAME))
-
-        robot_ini_loc = os.path.join(source_dir, ROBOT_INI_NAME)
-        logger.debug("Checking: {}".format(robot_ini_loc))
-        if os.path.exists(robot_ini_loc):
-            logger.info("Found {} in source space".format(ROBOT_INI_NAME))
-        else:
-            logger.warn("File does not exist: {}".format(robot_ini_loc))
-            logger.fatal("Cannot find a {}, aborting".format(ROBOT_INI_NAME))
-            sys.exit(_OS_EX_DATAERR)
-
+    #add base path to fanuc search paths
+    search_locs = []
+    if not args.override_ini:
+        search_locs.append(robot_ini_info.base_path)
+    search_locs.extend(FANUC_SEARCH_PATH)
 
     # try to find base directory for FANUC tools
     try:
-        fr_base_dir = find_fr_install_dir(search_locs=FANUC_SEARCH_PATH, is32bit=args.rg32)
+        fr_base_dir = find_fr_install_dir(search_locs=search_locs, is32bit=args.rg32)
         logger.info("Using {} as FANUC software base directory".format(fr_base_dir))
     except Exception as e:
         # not being able to find the Fanuc base dir is only a problem if:
@@ -323,18 +322,16 @@ def main():
 
     logger.info("ktrans location: {0}".format(ktrans_path))
 
+    # try to locate version and support files listed in robot.ini first
+    if isversion(robot_ini_info.version) and not args.override_ini:
+        logger.info("Setting default system core version to: {}".format(robot_ini_info.version))
+    else:
+        # try to find support directory for selected core software version
+        logger.info("Setting default system core version to: {}".format(args.core_version))
 
-    # try to find support directory for selected core software version
-    logger.info("Setting default system core version to: {}".format(args.core_version))
     # see if we need to find support dir ourselves
     if not args.support_dir:
-        try:
-            fr_support_dir = find_ktrans_support_dir(fr_base_dir=fr_base_dir,
-                version_string=args.core_version)
-        except Exception as e:
-            logger.fatal("Couldn't determine core software support directory, "
-                "aborting".format(e))
-            sys.exit(_OS_EX_DATAERR)
+        fr_support_dir = determine_support_dir(robot_ini_info, fr_base_dir, args)
     # or if user provided its location
     else:
         fr_support_dir = args.support_dir
@@ -747,6 +744,28 @@ def find_ktrans(kbin_name, search_locs):
     logger.warn("Can't find ktrans anywhere")
     raise MissingKtransException("Can't find {} anywhere".format(kbin_name))
 
+def determine_support_dir(robot_ini_info, fr_base_dir, args):
+    """
+        if argument --override is set find support directories
+        from specified core_version, else use robot.ini support
+        path.
+    """
+    if args.override_ini:
+        try:
+            return find_ktrans_support_dir(fr_base_dir=fr_base_dir,
+                version_string=args.core_version)
+        except Exception as e:
+            logger.fatal("Couldn't determine core software support directory, "
+                "aborting".format(e))
+            sys.exit(_OS_EX_DATAERR)
+    else:
+        if (os.path.exists(robot_ini_info.support)):
+            return robot_ini_info.support
+        else:
+            logger.fatal("Couldn't determine software support from robot.ini.")
+            logger.fatal("ktransw will not work. aborting.")
+            sys.exit(_OS_EX_DATAERR)
+
 
 def find_ktrans_support_dir(fr_base_dir, version_string):
     logger.debug('Trying to find support dir for core version: {}'.format(version_string))
@@ -762,7 +781,98 @@ def find_ktrans_support_dir(fr_base_dir, version_string):
         .format(version_string))
 
 
+def find_robotini(source_dir, args):
+    """
+      check we can find a usable robot.ini somewhere.
+      strategy:
+        - if user provided a location, use that
+        - if not, try CWD (default value of arg is relative to CWD)
+        - if that doesn't work, try source space
+    """
 
+    # because 'args.robot_ini' has a default which is simply 'robot.ini', we
+    # cover the first two cases in the above list with this single statement
+    robot_ini_loc = os.path.abspath(args.robot_ini)
+
+    # check that it actually exists
+    logger.debug("Checking: {}".format(robot_ini_loc))
+    if not os.path.exists(robot_ini_loc):
+        logger.warn("No {} in CWD, and no alternative provided, trying "
+            "source space".format(ROBOT_INI_NAME))
+
+        robot_ini_loc = os.path.join(source_dir, ROBOT_INI_NAME)
+        logger.debug("Checking: {}".format(robot_ini_loc))
+        if os.path.exists(robot_ini_loc):
+            logger.info("Found {} in source space".format(ROBOT_INI_NAME))
+        else:
+            logger.warn("File does not exist: {}".format(robot_ini_loc))
+            logger.fatal("Cannot find a {}, aborting".format(ROBOT_INI_NAME))
+            sys.exit(_OS_EX_DATAERR)
+    
+    return robot_ini_loc
+
+def is_robotini(config):
+    """Check robot.ini files contents and make sure file has
+       the appropriate keys
+    """
+    #compare list with keys in config. They should match.
+    array = ['robot', 'version', 'path', 'support', 'output']
+
+    d = {k:v for (k,v) in config['WinOLPC_Util'].items() if k in array}
+    
+    return len(d) == len(array)
+
+
+def isversion(version):
+    """Check formatting of version
+    """
+    import re
+    v = re.compile(r'v\d+.\d+-\d+', re.IGNORECASE)
+    return re.search(v, version)
+
+    
+
+def parse_robotini(fpath):
+    config = configparser.ConfigParser()
+    config.read(fpath)
+
+    # check that ini file has proper section
+    if not 'WinOLPC_Util' in config:
+        logger.fatal("Not a robot.ini file. Missing ['WinOLPC_Util'] section.")
+        logger.fatal("Re-export robot.ini file from setrobot.exe. Aborting.")
+        sys.exit(_OS_EX_DATAERR)
+    
+    if not is_robotini(config):
+        logger.fatal("Re-export robot.ini file from setrobot.exe.")
+        logger.fatal(" Missing keys. Aborting.")
+        sys.exit(_OS_EX_DATAERR)
+
+    #get rid of slashes in front and behind of drive letter (i.e. \\C\\ -> C:\\)
+    config['WinOLPC_Util']['Robot'] = config['WinOLPC_Util']['Robot'][1] + ':' + config['WinOLPC_Util']['Robot'][2:]
+
+    #check that paths in robot.ini file exist. 
+    ## ignore version as its not a path
+    ## ignore outfile as does not matter for rossum or ktransw
+    for k,v in config['WinOLPC_Util'].items():
+        if k == 'robot'and k == 'path' and k == 'support' and not os.path.exists(v):
+            logger.fatal("Directory '{0}' in robot.ini does not exist. Aborting".format(v))
+            sys.exit(_OS_EX_DATAERR)
+
+    #try to add a base path to use to find ktrans.exe and roboguide
+    # if WinOLPC folder is not found ignore a path for base_path.
+    try:
+        config['WinOLPC_Util']['Base_Path'] = config['WinOLPC_Util']['Path'].split("\\WinOLPC")[0]
+    except:
+        config['WinOLPC_Util']['Base_Path'] = ""
+        pass
+
+    return robotiniInfo(
+        robot=config['WinOLPC_Util']['Robot'],
+        version=config['WinOLPC_Util']['Version'],
+        base_path=config['WinOLPC_Util']['Base_Path'],
+        version_path=config['WinOLPC_Util']['Path'],
+        support=config['WinOLPC_Util']['Support'],
+        output=config['WinOLPC_Util']['Output'])
 
 if __name__ == '__main__':
     main()

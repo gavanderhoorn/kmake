@@ -96,6 +96,10 @@ optional arguments:
   -p, --pkg-dir         Additional paths to search for packages (multiple
                         allowed)
   -r, --robot-ini       Location of robot.ini (default: source dir)
+  -o, --override        Overrides path locations and version in robot.ini file.
+                        For example if the robot.ini file specifies V9.10-1 with
+                        V9.10-1 support files, use --override and --core ID V7.70-1
+                        to build for another robot controller version.
   -w, --overwrite       Overwrite any Makefile that may exist in the build dir
 
 Usage example:
@@ -104,7 +108,38 @@ Usage example:
   cd C:\foo\bar\build
   rossum C:\foo\bar\src
 ```
+## Robot.ini
 
+robot.ini file should be created using the `setrobot.exe` tool found in your
+roboguides bin directory (e.g. C:\Program Files (x86)\Fanuc\WinOLPC\bin).
+
+1. Navigate to winOLPC installation folder
+2. Delete any robot.ini files in folder
+3. Right click **Run as administrator**
+4. Select the robot Work Cell
+
+robot.ini file should be formatted as follows
+
+```
+[WinOLPC_Util]
+Robot=\C\Users\%USERNAME%\Documents\My Workcells\OlpcPRO1\Robot_1
+Version=V8.20-1
+Path=C:\Program Files (x86)\Fanuc\WinOLPC\Versions\V820-1\bin
+Support=C:\Users\%USERNAME%\Documents\My Workcells\OlpcPRO1\Robot_1\support
+Output=C:\Users\%USERNAME%\Documents\My Workcells\OlpcPRO1\Robot_1\output
+```
+
+If `Robot`, `Path`, or `Support` paths do not exist ktrans.exe and thus
+ktransw will fail. Ensure that paths specified exist and are accurate.
+
+You can override these paths by including the -o, --override argument and
+specifying your own version with the --core argument or the
+ROSSUM_CORE_VERSION environment variable. This will build the ninja file 
+with the specified version and use the support files of that version.
+
+Note: robot.ini file is still needed and will be used by `ktrans.exe`.Therefore
+accurate paths are needed in the robot.ini file even if they are not used by
+ktransw.
 
 ## Environment variables
 
