@@ -657,6 +657,8 @@ def resolve_includes(pkgs):
     for pkg in pkgs:
         visited = set()
         logger.debug("  {}".format(pkg.manifest.name))
+        # TODO: is dedup ok here? Doesn't change order of include dirs, but
+        #       does change the resulting include path
         inc_dirs = dedup(resolve_includes_for_pkg(pkg, visited))
         pkg.include_dirs.extend(inc_dirs)
         logger.debug("    added {} path(s)".format(len(inc_dirs)))
