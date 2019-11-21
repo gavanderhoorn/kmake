@@ -1,4 +1,4 @@
-open @(ip)
+open @(ws.robot_ini.ftp)
 anon
 bin
 prompt
@@ -7,7 +7,7 @@ mdel @
 @[for pkg in ws.pkgs]@
 @[if len(pkg.objects) > 0]@
 @[for (src, obj) in pkg.objects]@
-"@(ws.build.path)\@(obj)" @
+"@(obj)" @
 @[end for]@
 @[end if]@
 @[end for]@
@@ -18,7 +18,7 @@ mdel @
 @[if len(pkg.objects) > 0]@
 @[for (src, obj) in pkg.objects]@
 @[if '.pc' in obj]@
-"@(ws.build.path)\@(os.path.splitext(obj)[0]+'.vr')" @
+"@(os.path.splitext(obj)[0]+'.vr')" @
 @[end if]@
 @[end for]@
 @[end if]@
