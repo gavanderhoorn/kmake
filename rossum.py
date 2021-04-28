@@ -27,10 +27,12 @@
 
 import em
 import datetime
-import os
+import os, shutil
 import sys
 import json
+import configparser
 import fnmatch
+from send2trash import send2trash
 
 import collections
 
@@ -46,30 +48,44 @@ _OS_EX_DATAERR=65
 
 KL_SUFFIX = 'kl'
 PCODE_SUFFIX = 'pc'
+TP_SUFFIX = 'ls'
+TPCODE_SUFFIX = 'tp'
+TPP_SUFFIX = 'tpp'
+TPP_INTERP_SUFFIX = 'ls'
+YAML_SUFFIX = 'yml'
+XML_SUFFIX = 'xml'
+CSV_SUFFIX = 'csv'
 
 ENV_PKG_PATH='ROSSUM_PKG_PATH'
 ENV_DEFAULT_CORE_VERSION='ROSSUM_CORE_VERSION'
+ENV_SERVER_IP='ROSSUM_SERVER_IP'
+
 BUILD_FILE_NAME='build.ninja'
 BUILD_FILE_TEMPLATE_NAME='build.ninja.em'
 
+FTP_FILE_NAME='ftp.txt'
+FTP_FILE_TEMPLATE_NAME='ftp.txt.em'
+
 FANUC_SEARCH_PATH = [
-    'C:/Program Files/Fanuc',
-    'C:/Program Files (x86)/Fanuc',
-    'D:/Program Files/Fanuc',
-    'D:/Program Files (x86)/Fanuc',
+    'C:\\Program Files\\Fanuc',
+    'C:\\Program Files (x86)\\Fanuc',
+    'D:\\Program Files\\Fanuc',
+    'D:\\Program Files (x86)\\Fanuc',
 ]
 
 KTRANS_BIN_NAME='ktrans.exe'
+KTRANSW_BIN_NAME='ktransw.cmd'
+MAKETP_BIN_NAME='maketp.exe'
+TPP_BIN_NAME='tpp.bat'
+XML_BIN_NAME='yamljson2xml.cmd'
+
 KTRANS_SEARCH_PATH = [
-    'C:/Program Files/Fanuc/WinOLPC/bin',
-    'C:/Program Files (x86)/Fanuc/WinOLPC/bin',
-    'D:/Program Files/Fanuc/WinOLPC/bin',
-    'D:/Program Files (x86)/Fanuc/WinOLPC/bin',
+    'C:\\Program Files\\Fanuc\\WinOLPC\\bin',
+    'C:\\Program Files (x86)\\Fanuc\\WinOLPC\\bin',
+    'D:\\Program Files\\Fanuc\\WinOLPC\\bin',
+    'D:\\Program Files (x86)\\Fanuc\\WinOLPC\\bin',
 ]
 
-KTRANSW_BIN_NAME='ktransw.cmd'
-
-MAKETP_NAME='maketp.exe'
 ROBOT_INI_NAME='robot.ini'
 
 MANIFEST_VERSION=1
@@ -97,7 +113,7 @@ KtransInfo = collections.namedtuple('KtransInfo', 'path support')
 
 KtransWInfo = collections.namedtuple('KtransWInfo', 'path')
 
-KtransRobotIniInfo = collections.namedtuple('KtransRobotIniInfo', 'path')
+KtransRobotIniInfo = collections.namedtuple('KtransRobotIniInfo', 'path ftp env')
 
 # In-memory representation of raw data from a parsed rossum manifest
 RossumManifest = collections.namedtuple('RossumManifest',
@@ -134,7 +150,26 @@ RossumWorkspace = collections.namedtuple('RossumWorkspace',
     'sources'    #  - one or more 'source space(s)'
 )
 
+#container for contents of ini file
+robotiniInfo = collections.namedtuple('robotiniInfo',
+    'robot '
+    'version '
+    'base_path ' #base_path designates the base directory where WinOLPC
+                 # or roboguide is installed eg. C:\Program Files (x86)\Fanuc\
+    'version_path ' #version path is where applications for specified version are stored
+                    # eg. C:\Program Files (x86)\Fanuc\WinOLPC\Versions\V910-1\bin
+    'support '
+    'output '
+    'ftp ' # ftp address where the robot server resides
+    'env' # environment file location for tp-plus
+    )
 
+# container datatype for graph class
+packages = collections.namedtuple('packages',
+    'name '
+    'version '
+    'inSource'
+)
 
 
 
@@ -180,8 +215,6 @@ def main():
             "FANUC registry keys)")
     parser.add_argument('-d', '--dry-run', action='store_true', dest='dry_run',
         help='Do everything except writing to build file')
-    parser.add_argument('--ktrans', type=str, dest='ktrans', metavar='PATH',
-        help="Location of ktrans (default: auto-detect)")
     parser.add_argument('--ktransw', type=str, dest='ktransw', metavar='PATH',
         help="Location of ktransw (default: assume it's on the Windows PATH)")
     parser.add_argument('-n', '--no-env', action='store_true', dest='no_env',
@@ -195,11 +228,63 @@ def main():
         help="Location of {0} (default: source dir)".format(ROBOT_INI_NAME))
     parser.add_argument('-w', '--overwrite', action='store_true', dest='overwrite',
         help='Overwrite any build file that may exist in the build dir')
-    parser.add_argument('src_dir', type=str, metavar='SRC',
+    parser.add_argument('--ftp', action='store_true', dest='server_ip',
+        default= os.environ.get(ENV_SERVER_IP),
+        help='send to ip address specified.'
+        'This will override env variable, {0}.'.format(ENV_SERVER_IP))
+    parser.add_argument('-o', '--override', action='store_true', dest='override_ini',
+        help='override robot.ini file directories with specified paths')
+    parser.add_argument('-b', '--buildall', action='store_true', dest='buildall',
+        help='build all objects source space depends on.')
+    parser.add_argument('-g', '--keepgpp', action='store_true', dest='keepgpp',
+        help='build all objects source space depends on.')
+    parser.add_argument('-tp', '--compiletp', action='store_true', dest='compiletp',
+        help='compile .tpp files into .tp files. If false will just interpret to .ls.')
+    parser.add_argument('-t', '--include-tests', action='store_true', dest='inc_tests',
+        help='include files for testing in build')
+    parser.add_argument('--clean', action='store_true', dest='rossum_clean',
+        help='clean all files out of build directory')
+    parser.add_argument('src_dir', type=str, nargs='?', metavar='SRC',
         help="Main directory with packages to build")
     parser.add_argument('build_dir', type=str, nargs='?', metavar='BUILD',
         help="Directory for out-of-source builds (default: 'cwd')")
     args = parser.parse_args()
+
+
+
+    ############################################################################
+    #
+    # Validation
+    #
+
+
+    # build dir is either CWD or user specified it
+    build_dir   = os.path.abspath(args.build_dir or os.getcwd())
+    #clean out files
+    # (ref): https://stackoverflow.com/questions/185936/how-to-delete-the-contents-of-a-folder
+    if args.rossum_clean:
+      # make sure folder has build.ninja file or do not delete
+      file_list = os.listdir(build_dir)
+      if not any('build.ninja' in s for s in file_list):
+        print('Refuse deletion of folder contents. Folder must have a build.ninja file')
+        sys.exit(1)
+
+      for filename in os.listdir(build_dir):
+        file_path = os.path.join(build_dir, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                send2trash(file_path)
+        except Exception as e:
+            print('Failed to delete %s. Reason: %s' % (file_path, e))
+      
+      sys.exit(1)
+
+    
+    #source directory needs to be specified
+    if not args.src_dir:
+      raise RuntimeError("Source directory must be specified.")
+    source_dir  = os.path.abspath(args.src_dir)
+    extra_paths = [os.path.abspath(p) for p in args.extra_paths]
 
 
     # configure the logger
@@ -212,20 +297,7 @@ def main():
     if args.quiet:
         logger.setLevel(logging.WARNING)
 
-
     logger.info("This is rossum v{0}".format(ROSSUM_VERSION))
-
-
-
-    ############################################################################
-    #
-    # Validation
-    #
-
-    # build dir is either CWD or user specified it
-    build_dir   = os.path.abspath(args.build_dir or os.getcwd())
-    source_dir  = os.path.abspath(args.src_dir)
-    extra_paths = [os.path.abspath(p) for p in args.extra_paths]
 
 
     # make sure that source dir exists
@@ -249,95 +321,54 @@ def main():
         # TODO: find appropriate exit code
         sys.exit(_OS_EX_DATAERR)
 
+    #find robot.ini file
+    robot_ini_loc = find_robotini(source_dir, args)
+    #parse robot.ini file into collection tuple 'robotiniInfo'
+    robot_ini_info = parse_robotini(robot_ini_loc)
 
-    # check we can find a usable robot.ini somewhere.
-    # strategy:
-    #  - if user provided a location, use that
-    #  - if not, try CWD (default value of arg is relative to CWD)
-    #  - if that doesn't work, try source space
-
-    # because 'args.robot_ini' has a default which is simply 'robot.ini', we
-    # cover the first two cases in the above list with this single statement
-    robot_ini_loc = os.path.abspath(args.robot_ini)
-
-    # check that it actually exists
-    logger.debug("Checking: {}".format(robot_ini_loc))
-    if not os.path.exists(robot_ini_loc):
-        logger.warning("No {} in CWD, and no alternative provided, trying "
-            "source space".format(ROBOT_INI_NAME))
-
-        robot_ini_loc = os.path.join(source_dir, ROBOT_INI_NAME)
-        logger.debug("Checking: {}".format(robot_ini_loc))
-        if os.path.exists(robot_ini_loc):
-            logger.info("Found {} in source space".format(ROBOT_INI_NAME))
-        else:
-            logger.warning("File does not exist: {}".format(robot_ini_loc))
-            logger.fatal("Cannot find a {}, aborting".format(ROBOT_INI_NAME))
-            sys.exit(_OS_EX_DATAERR)
-
-        # non-"empty" robot.ini files may conflict with rossum and/or ktransw
-        # CLAs. Ideally, we'd allow rossum/ktransw CLAs to override paths and
-        # other settings from robot.ini files, but for now we'll only just
-        # WARN the user if we find a non-empty file.
-        with open(robot_ini_loc, 'r') as f:
-            robot_ini_txt = f.read()
-            if ('Path' in robot_ini_txt) or ('Support' in robot_ini_txt):
-                logger.warning("Found {} contains potentially conflicting ktrans "
-                    "settings!".format(ROBOT_INI_NAME))
-
+    #add base path to fanuc search paths
+    search_locs = []
+        
+    search_locs.append(robot_ini_info.base_path)
+    search_locs.extend(FANUC_SEARCH_PATH)
 
     # try to find base directory for FANUC tools
     try:
         fr_base_dir = find_fr_install_dir(search_locs=FANUC_SEARCH_PATH, is64bit=args.rg64)
         logger.info("Using {} as FANUC software base directory".format(fr_base_dir))
     except Exception as e:
-        # not being able to find the Fanuc base dir is only a problem if:
-        #  1) no ktrans.exe location provided
-        #  2) no support dir location provided
-        #
-        # exit with a fatal error if we're missing either of those
-        if (not args.ktrans or not args.support_dir):
+        # not being able to find the Fanuc base dir is a fatal error
+        # without a base directory roboguide is most likely not installed
+        # on the system, and ktrans, and maketp will not work without a
+        # workcell emulation.
             logger.fatal("Error trying to detect FANUC base-dir: {0}".format(e))
-            logger.fatal("Please provide alternative locations for ktrans and support dir using")
-            logger.fatal("the '--ktrans' and '--support' options.")
+            logger.fatal("Please make sure that roboguide, or OlpcPRO are installed.")
             logger.fatal("Cannot continue, aborting")
             sys.exit(_OS_EX_DATAERR)
 
-        # if both of those have been provided we don't care and can continue
-        logger.warning("Error trying to detect FANUC base-dir: {0}".format(e))
-        logger.warning("Continuing with provided arguments")
-
-
-    # TODO: maybe generalise into 'find_tool(..)' or something (for maketp etc)
-    # see if we need to find ktrans ourselves
-    ktrans_path = KTRANS_BIN_NAME
-    if not args.ktrans:
-        logger.debug("Trying to auto-detect ktrans location ..")
-
-        try:
-            search_locs = [fr_base_dir]
-            search_locs.extend(KTRANS_SEARCH_PATH)
-            ktrans_path = find_ktrans(kbin_name=KTRANS_BIN_NAME, search_locs=search_locs)
-        except MissingKtransException as mke:
-            logger.fatal("Aborting: {0}".format(mke))
-            sys.exit(_OS_EX_DATAERR)
-        except Exception as e:
-            logger.fatal("Aborting: {0} (unhandled, please report)".format(e))
-            sys.exit(_OS_EX_DATAERR)
-    # or if user provided its location
+    #make list of tool names
+    tools = [KTRANS_BIN_NAME, KTRANSW_BIN_NAME, MAKETP_BIN_NAME, TPP_BIN_NAME, XML_BIN_NAME]
+    # preset list of paths to search for paths
+    search_locs = []
+    search_locs.extend(KTRANS_SEARCH_PATH)
+    # add environment path to search
+    search_locs.extend([p for p in os.environ['Path'].split(os.pathsep) if len(p) > 0])
+    #find build tools
+    path_lst = find_tools(search_locs, tools, args)
+    # put list into dictionary for file type build rule
+    tool_paths = {
+        'ktrans' : {'from_suffix' : '0', 'to_suffix' : '0', 'path' : path_lst[0]},
+        'ktransw' : {'from_suffix' : KL_SUFFIX, 'interp_suffix' : PCODE_SUFFIX, 'comp_suffix' : PCODE_SUFFIX, 'path' : (args.ktransw or path_lst[1])},
+        'yaml' : {'from_suffix' : YAML_SUFFIX, 'interp_suffix' : XML_SUFFIX,  'comp_suffix' : XML_SUFFIX, 'path' : path_lst[4]},
+        'csv' : {'from_suffix' : CSV_SUFFIX, 'interp_suffix' : CSV_SUFFIX,  'comp_suffix' : CSV_SUFFIX, 'path' : 'C:\\Windows\\SysWOW64\\xcopy.exe'}
+    }
+    #for tpp decide if just interpreting, or compiling to tp
+    if args.compiletp:
+      tool_paths['maketp'] = {'from_suffix' : TP_SUFFIX, 'interp_suffix' : TPCODE_SUFFIX, 'comp_suffix' : TPCODE_SUFFIX, 'path' : path_lst[2]}
+      tool_paths['tpp'] = {'from_suffix' : TPP_SUFFIX, 'interp_suffix' : TPP_INTERP_SUFFIX, 'comp_suffix' : TPCODE_SUFFIX, 'path' : path_lst[3], 'compile' : path_lst[2]}
     else:
-        logger.debug("User provided ktrans location: {0}".format(args.ktrans))
-        ktrans_path = os.path.abspath(args.ktrans)
-        logger.debug("Setting ktrans path to: {0}".format(ktrans_path))
-
-        # make sure it exists
-        if not os.path.exists(ktrans_path):
-            logger.fatal("Specified ktrans location ({0}) does not exist. "
-                "Aborting.".format(ktrans_path))
-            sys.exit(_OS_EX_DATAERR)
-
-    logger.info("ktrans location: {0}".format(ktrans_path))
-
+      tool_paths['maketp'] = {'from_suffix' : TP_SUFFIX, 'interp_suffix' : TP_SUFFIX, 'comp_suffix' : TP_SUFFIX, 'path' : 'C:\\Windows\\SysWOW64\\xcopy.exe'}
+      tool_paths['tpp'] = {'from_suffix' : TPP_SUFFIX, 'interp_suffix' : TPP_INTERP_SUFFIX, 'comp_suffix' : TPP_INTERP_SUFFIX, 'path' : path_lst[3]}
 
     # try to find support directory for selected core software version
     logger.info("Setting default system core version to: {}".format(args.core_version))
@@ -364,15 +395,12 @@ def main():
     logger.info("Karel core support dir: {}".format(fr_support_dir))
 
 
-    # if user didn't supply an alternative, assume it's on the PATH
-    ktransw_path = args.ktransw or KTRANSW_BIN_NAME
-    logger.info("ktransw location: {0}".format(ktransw_path))
-
-
     # template and output file locations
     template_dir  = os.path.dirname(os.path.realpath(__file__))
-    template_path = os.path.join(template_dir, BUILD_FILE_TEMPLATE_NAME)
+    template_path = os.path.join(template_dir, BUILD_FILE_TEMPLATE_NAME) # for ninja file
     build_file_path = os.path.join(build_dir, BUILD_FILE_NAME)
+    template_ftp_path = os.path.join(template_dir, FTP_FILE_TEMPLATE_NAME) # for ftp
+    ftp_file_path = os.path.join(build_dir, FTP_FILE_NAME)
 
     # check
     if not os.path.isfile(template_path):
@@ -399,6 +427,7 @@ def main():
 
     # discover packages
     src_space_pkgs = find_pkgs(src_space_dirs)
+    src_space_pkgs = remove_duplicates(src_space_pkgs)
     logger.info("Found {0} package(s) in source space(s):".format(len(src_space_pkgs)))
     for pkg in src_space_pkgs:
         logger.info("  {0} (v{1})".format(pkg.manifest.name, pkg.manifest.version))
@@ -413,6 +442,7 @@ def main():
             logger.info('  {0}'.format(p))
 
         other_pkgs.extend(find_pkgs(other_pkg_dirs))
+        other_pkgs = remove_duplicates(other_pkgs)
         logger.info("Found {0} package(s) in other location(s):".format(len(other_pkgs)))
         for pkg in other_pkgs:
             logger.info("  {0} (v{1})".format(pkg.manifest.name, pkg.manifest.version))
@@ -422,26 +452,31 @@ def main():
     all_pkgs = []
     all_pkgs.extend(src_space_pkgs)
     all_pkgs.extend(other_pkgs)
+    all_pkgs = remove_duplicates(all_pkgs)
 
-    # make sure all their dependencies are present
-    try:
-        check_pkg_dependencies(all_pkgs)
-    except Exception as e:
-        logger.fatal("Error occured while checking packages: {}. Cannot "
-            "continue".format(e))
-        # TODO: find appropriate exit code
-        sys.exit(_OS_EX_DATAERR)
+    # build out dependency trees
+    # for all packages in src_space
+    dependency_graph = create_dependency_graph(src_space_pkgs, all_pkgs)
+    #log dependency trees to logger
+    log_dep_tree(dependency_graph)
+    #filter out additional packages that are not dependencies
+    all_pkgs = filter_packages(all_pkgs, dependency_graph)
 
     # all discovered pkgs get used for dependency and include path resolution,
-    resolve_dependencies(all_pkgs)
     resolve_includes(all_pkgs)
 
+    # select to just build source or all related packages
+    if args.buildall:
+        build_pkgs = all_pkgs
+    else: 
+        build_pkgs = src_space_pkgs
+
     # but only the pkgs in the source space(s) get their objects build
-    gen_obj_mappings(src_space_pkgs)
+    gen_obj_mappings(build_pkgs, tool_paths, args)
 
 
     # notify user of config
-    logger.info("Building {} package(s)".format(len(src_space_pkgs)))
+    logger.info("Building {} package(s)".format(len(build_pkgs)))
     logger.info("Build configuration:")
     logger.info("  source dir: {0}".format(source_dir))
     logger.info("  build dir : {0}".format(build_dir))
@@ -460,19 +495,45 @@ def main():
     # Template processing
     #
 
+    configs = {}
+    #support directory
+    configs['support'] = fr_support_dir
+    # set core version
+    configs['version'] = args.core_version
+    # set ip address to upload files to
+    configs['ftp'] = args.server_ip
+    #tpp env file
+    configs['env'] = ''
+
+    # update struct if not using robot.ini presets
+    if args.override_ini:
+        configs['support'] = robot_ini_info.support
+        # set core version
+        configs['version'] = robot_ini_info.version
+        # set ip address to upload files to
+        configs['ftp'] = robot_ini_info.ftp
+        #tpp env
+        configs['env'] = robot_ini_info.env
+
+
     # populate dicts & lists needed by template
-    ktrans = KtransInfo(path=ktrans_path, support=KtransSupportDirInfo(
-        path=fr_support_dir,
-        version_string=args.core_version))
-    ktransw = KtransWInfo(path=ktransw_path)
+    ktrans = KtransInfo(path=tool_paths['ktrans']['path'], support=KtransSupportDirInfo(
+        path=configs['support'],
+        version_string=configs['version']))
+    ktransw = KtransWInfo(path=tool_paths['ktransw']['path'])
     bs_info = RossumSpaceInfo(path=build_dir)
     sp_infos = [RossumSpaceInfo(path=p) for p in src_space_dirs]
-    robini_info = KtransRobotIniInfo(path=robot_ini_loc)
+    robini_info = KtransRobotIniInfo(path=robot_ini_loc, ftp=configs['ftp'], env=configs['env'])
 
     ws = RossumWorkspace(build=bs_info, sources=sp_infos,
-        robot_ini=robini_info, pkgs=src_space_pkgs)
+        robot_ini=robini_info, pkgs=build_pkgs)
 
 
+    #if --keepgpp is set insert flag into ktrans call in
+    # build.ninja.em so that temp builds in %TEMP% are kept
+    keep_buildd = ''
+    if args.keepgpp:
+        keep_buildd = '-k'
 
     # don't overwrite existing files, unless instructed to do so
     if (not args.overwrite) and os.path.exists(build_file_path):
@@ -481,26 +542,35 @@ def main():
         # TODO: find appropriate exit code
         sys.exit(_OS_EX_DATAERR)
 
-    # write out template
-    with open(build_file_path, 'w') as ofile:
-        # setup the dict for empy
-        globls = {
-            'ws'             : ws,
-            'ktrans'         : ktrans,
-            'ktransw'        : ktransw,
-            'rossum_version' : ROSSUM_VERSION,
-            'tstamp'         : datetime.datetime.now().isoformat(),
-        }
-
-        interp = em.Interpreter(
-            output=ofile, globals=globls,
+    #store globals in container to be passed by empy
+    globls = {
+        'ws'             : ws,
+        'ktrans'         : ktrans,
+        'ktransw'        : ktransw,
+        'rossum_version' : ROSSUM_VERSION,
+        'tstamp'         : datetime.datetime.now().isoformat(),
+        'tools'          : tool_paths,
+        'keepgpp'        : keep_buildd,
+        'compiletp'      : args.compiletp
+    }
+    # write out ninja template
+    ninja_fl = open(build_file_path, 'w')
+    ninja_interp = em.Interpreter(
+            output=ninja_fl, globals=dict(globls),
             options={em.RAW_OPT : True, em.BUFFERED_OPT : True})
-
-        # load and process the template
-        logger.debug("Processing template")
-        interp.file(open(template_path))
-        logger.debug("Shutting down empy")
-        interp.shutdown()
+    # write out ftp push template
+    ftp_fl = open(ftp_file_path, 'w')
+    ftp_interp = em.Interpreter(
+            output=ftp_fl, globals=dict(globls),
+            options={em.RAW_OPT : True, em.BUFFERED_OPT : True})
+    # load and process the template
+    logger.debug("Processing template")
+    ninja_interp.file(open(template_path))
+    ftp_interp.file(open(template_ftp_path))
+    # shutdown empy interpreters
+    logger.debug("Shutting down empy")
+    ninja_interp.shutdown()
+    ftp_interp.shutdown()
 
 
     # done
@@ -585,23 +655,19 @@ def find_pkgs(dirs):
 
     return pkgs
 
-
-def check_pkg_dependencies(pkgs):
-    """ make sure all dependencies are present
+def remove_duplicates(pkgs):
+    """create a seperate set with unique package names.
+       input list must be the format of the collection
+       RossumPackage.
     """
-    known_pkgs = [p.manifest.name for p in pkgs]
-    logger.debug("Checking dependencies for: {}".format(', '.join(known_pkgs)))
+    visited = set()
+    set_pkgs = []
     for pkg in pkgs:
-        logger.debug("  {0} - deps: {1}".format(
-            pkg.manifest.name,
-            ', '.join(pkg.manifest.depends) if len(pkg.manifest.depends) else 'none'))
-
-        missing = set(pkg.manifest.depends).difference(known_pkgs)
-        if len(missing) > 0:
-            raise MissingPkgDependency("Package {0} is missing dependencies: {1}"
-                .format(pkg.manifest.name, ', '.join(missing)))
-        else:
-            logger.debug("    satisfied")
+        if pkg.manifest.name not in visited:
+            visited.add(pkg.manifest.name)
+            set_pkgs.append(pkg)
+    
+    return set_pkgs
 
 
 def find_in_list(l, pred):
@@ -610,24 +676,86 @@ def find_in_list(l, pred):
             return i
     return None
 
-def resolve_dependencies(pkgs):
-    """ Maps dependency pkg names to RossumPackage instances
+
+def create_dependency_graph(source_pkgs, all_pkgs):
     """
-    pkg_names = [p.manifest.name for p in pkgs]
+    Creates dependency graph for build
+    Maps dependency pkg names to RossumPackage instances
+    """
+    # debug: show user source packages to resolve dependencies for
+    pkg_names = [p.manifest.name for p in source_pkgs]
     logger.debug("Resolving dependencies for: {}".format(', '.join(pkg_names)))
-    for pkg in pkgs:
-        logger.debug("  {}".format(pkg.manifest.name))
 
-        for dep_pkg_name in pkg.manifest.depends:
-            dep_pkg = find_in_list(pkgs, lambda p: p.manifest.name == dep_pkg_name)
+    #start a dependency graph
+    dep_graph = Graph()
+    for pkg in source_pkgs:
+        # set to track visited packages to avoid circular referencing
+        visited = set()
+        # add to final_pkgs object
+        # set package as a root on dependency tree
+        dep_graph.setRoot(pkg.manifest.name, pkg.manifest.version)
+        # Search through dependencies and add to dep graph and to
+        # dependencies in RossumPackage collection
+        add_dependency(pkg, visited, dep_graph, all_pkgs)
+    
+    return dep_graph
 
-            # this should not be possible, as pkg dependency relationships
-            # should have been checked earlier, but you never know.
+def add_dependency(src_package, visited, graph, pkgs):
+    """
+    """
+    if src_package.manifest.name not in visited:
+        logger.debug("  {}:".format(src_package.manifest.name))
+        for depend_name in src_package.manifest.depends:
+            dep_pkg = find_in_list(pkgs, lambda p: p.manifest.name == depend_name)
             if dep_pkg is None:
                 raise MissingPkgDependency("Error finding internal pkg instance for '{}', "
-                    "can't find it".format(dep_pkg_name))
-            logger.debug("    {}: found".format(dep_pkg_name))
-            pkg.dependencies.append(dep_pkg)
+                    "can't find it".format(depend_name))
+            # add graph edge and put dependencies into RossumPackage Object
+            graph.addEdge(src_package.manifest.name, depend_name, dep_pkg.manifest.version, False)
+            logger.debug("    {}: found".format(depend_name))
+            src_package.dependencies.append(dep_pkg)
+            # after dependency has been added track to visited set to avoid circular dependencies
+            visited.add(src_package.manifest.name)
+            #if depend package has dependencies search for those as well
+            if len(dep_pkg.manifest.depends) > 0:
+                add_dependency(dep_pkg, visited, graph, pkgs)
+
+def log_dep_tree(graph):
+    """write depedency trees from source packages
+       to debug logger
+    """
+    pkg_names = [p.name for p in graph.root]
+    for name in pkg_names:
+        #print depedency tree for logger
+        logger.debug("Printing dependency tree for: {}".format(name))
+        depstring = graph.print_dependencies(name)
+        if depstring is not None:
+            ## split into seperate lines for debug logger
+            depstring = depstring.splitlines()
+            for line in depstring:
+                logger.debug("  {}".format(line))
+
+
+def filter_packages(pkgs, graph):
+    """filter out packages in RossumPackage that
+       are not in the dependency tree
+    """
+    #create new list to store applicable packages
+    filtered = []
+    #find all root packages in the source
+    pkg_names = [p.name for p in graph.root]
+    # track visited packages to avoid duplicates
+    visited = set()
+    for name in pkg_names:
+        #retrieve all packages the source package depends on
+        deps = graph.depthFirstSearch(name)
+        if len(deps) > 0:
+            for d in deps:
+                if d not in visited:
+                    filtered.append(find_in_list(pkgs, lambda p: p.manifest.name == d))
+                    visited.add(d)
+    # return filtered list of packages
+    return filtered
 
 
 def dedup(seq):
@@ -653,12 +781,10 @@ def resolve_includes(pkgs):
     """
     pkg_names = [p.manifest.name for p in pkgs]
     logger.debug("Resolving includes for: {}".format(', '.join(pkg_names)))
-
+    
     for pkg in pkgs:
         visited = set()
         logger.debug("  {}".format(pkg.manifest.name))
-        # TODO: is dedup ok here? Doesn't change order of include dirs, but
-        #       does change the resulting include path
         inc_dirs = dedup(resolve_includes_for_pkg(pkg, visited))
         pkg.include_dirs.extend(inc_dirs)
         logger.debug("    added {} path(s)".format(len(inc_dirs)))
@@ -681,7 +807,7 @@ def resolve_includes_for_pkg(pkg, visited):
     return inc_dirs
 
 
-def gen_obj_mappings(pkgs):
+def gen_obj_mappings(pkgs, mappings, args):
     """ Updates the 'objects' member variable of each pkg with tuples of the
     form (path\to\a.kl, a.pc).
     """
@@ -693,16 +819,22 @@ def gen_obj_mappings(pkgs):
 
         for src in pkg.manifest.source:
             src = src.replace('/', '\\')
-            obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], PCODE_SUFFIX)
+            for (k, v) in mappings.items():
+                if '.' + v['from_suffix'] in src:
+                    obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['interp_suffix'])
+                    build = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['comp_suffix'])
             logger.debug("    adding: {} -> {}".format(src, obj))
-            pkg.objects.append((src, obj))
+            pkg.objects.append((src, obj, build))
 
-        # TODO: refactor this: make test rule generation optional
-        for src in pkg.manifest.tests:
-            src = src.replace('/', '\\')
-            obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], PCODE_SUFFIX)
-            logger.debug("    adding: {} -> {}".format(src, obj))
-            pkg.objects.append((src, obj))
+        if args.inc_tests:
+          for src in pkg.manifest.tests:
+              src = src.replace('/', '\\')
+              for (k, v) in mappings.items():
+                  if '.' + v['from_suffix'] in src:
+                      obj = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['interp_suffix'])
+                      build = '{}.{}'.format(os.path.splitext(os.path.basename(src))[0], v['comp_suffix'])
+              logger.debug("    adding: {} -> {}".format(src, obj))
+              pkg.objects.append((src, obj, build))
 
 
 def find_fr_install_dir(search_locs, is64bit=False):
@@ -747,23 +879,14 @@ def find_fr_install_dir(search_locs, is64bit=False):
     logger.warning("Exhausted all methods to find FANUC base-dir")
     raise Exception("Can't find FANUC base-dir anywhere")
 
-
-def find_ktrans(kbin_name, search_locs):
-    # TODO: check PATH first
-
+def find_program(tool, search_locs):
     for search_loc in search_locs:
-        # see if it is in the default location
-        ktrans_loc = os.path.join(search_loc, 'WinOLPC', 'bin')
-        ktrans_path = os.path.join(ktrans_loc, kbin_name)
-
-        logger.debug("Looking in {} ..".format(ktrans_loc))
-        if os.path.exists(ktrans_path):
-            logger.debug("Found {} in {}".format(kbin_name, ktrans_loc))
-            return ktrans_path
-
-    logger.warning("Can't find ktrans anywhere")
-    raise MissingKtransException("Can't find {} anywhere".format(kbin_name))
-
+        path = os.path.join(search_loc, tool)
+        if os.path.exists(path):
+            return path
+    
+    logger.warning("Can't find {} anywhere".format(tool))
+    raise MissingKtransException("Can't find {} anywhere".format(tool))
 
 def find_ktrans_support_dir(fr_base_dir, version_string):
     logger.debug('Trying to find support dir for core version: {}'.format(version_string))
@@ -778,7 +901,204 @@ def find_ktrans_support_dir(fr_base_dir, version_string):
     raise Exception("Can't determine ktrans support dir for core version {}"
         .format(version_string))
 
+def find_tools(search_locs, tools, args):
+    tool_paths =[]
+    for tool in tools:
+        try:
+            tool_path = find_program(tool, search_locs)
+            logger.info("{} location: {}".format(tool, tool_path))
+            tool_paths.append(tool_path)
+        except MissingKtransException as mke:
+            logger.fatal("Aborting: {0}".format(mke))
+            sys.exit(_OS_EX_DATAERR)
+        except Exception as e:
+            logger.fatal("Aborting: {0} (unhandled, please report)".format(e))
+            sys.exit(_OS_EX_DATAERR)
 
+    return tool_paths
+
+#---- Parse robot.ini file ----
+#####
+def find_robotini(source_dir, args):
+    """
+      check we can find a usable robot.ini somewhere.
+      strategy:
+        - if user provided a location, use that
+        - if not, try CWD (default value of arg is relative to CWD)
+        - if that doesn't work, try source space
+    """
+
+    # because 'args.robot_ini' has a default which is simply 'robot.ini', we
+    # cover the first two cases in the above list with this single statement
+    robot_ini_loc = os.path.abspath(args.robot_ini)
+
+    # check that it actually exists
+    logger.debug("Checking: {}".format(robot_ini_loc))
+    if not os.path.exists(robot_ini_loc):
+        logger.warning("No {} in CWD, and no alternative provided, trying "
+            "source space".format(ROBOT_INI_NAME))
+
+        robot_ini_loc = os.path.join(source_dir, ROBOT_INI_NAME)
+        logger.debug("Checking: {}".format(robot_ini_loc))
+        if os.path.exists(robot_ini_loc):
+            logger.info("Found {} in source space".format(ROBOT_INI_NAME))
+        else:
+            logger.warning("File does not exist: {}".format(robot_ini_loc))
+            logger.fatal("Cannot find a {}, aborting".format(ROBOT_INI_NAME))
+            sys.exit(_OS_EX_DATAERR)
+        
+        # non-"empty" robot.ini files may conflict with rossum and/or ktransw
+        # CLAs. Ideally, we'd allow rossum/ktransw CLAs to override paths and
+        # other settings from robot.ini files, but for now we'll only just
+        # WARN the user if we find a non-empty file.
+        with open(robot_ini_loc, 'r') as f:
+            robot_ini_txt = f.read()
+            if ('Path' in robot_ini_txt) or ('Support' in robot_ini_txt):
+                logger.warning("Found {} contains potentially conflicting ktrans "
+                    "settings!".format(ROBOT_INI_NAME))
+    
+    return robot_ini_loc
+
+def parse_robotini(fpath):
+    config = configparser.ConfigParser()
+    config.read(fpath)
+
+    # check that ini file has proper section
+    if not 'WinOLPC_Util' in config:
+        logger.fatal("Not a robot.ini file. Missing ['WinOLPC_Util'] section.")
+        logger.fatal("Re-export robot.ini file from setrobot.exe. Aborting.")
+        sys.exit(_OS_EX_DATAERR)
+
+    #get rid of slashes in front and behind of drive letter (i.e. \\C\\ -> C:\\)
+    config['WinOLPC_Util']['Robot'] = config['WinOLPC_Util']['Robot'][1] + ':' + config['WinOLPC_Util']['Robot'][2:]
+
+    #try to add a base path to use to find ktrans.exe and roboguide
+    # if WinOLPC folder is not found ignore a path for base_path.
+    try:
+        config['WinOLPC_Util']['Base_Path'] = config['WinOLPC_Util']['Path'].split("\\WinOLPC")[0]
+    except:
+        config['WinOLPC_Util']['Base_Path'] = ""
+        pass
+
+    #check that paths in robot.ini file exist. 
+    ## ignore version as its not a path
+    ## ignore outfile as does not matter for rossum or ktransw
+    for k,v in config['WinOLPC_Util'].items():
+        if (k == 'robot' or k == 'path' or k == 'support') and not os.path.exists(v):
+            logger.fatal("Directory '{0}' in robot.ini does not exist. Aborting".format(v))
+            sys.exit(_OS_EX_DATAERR)
+
+    # handle added 'ftp' key if omitted
+    if "Ftp" not in config['WinOLPC_Util']:
+        config['WinOLPC_Util']['Ftp'] = os.environ.get(ENV_SERVER_IP)
+
+    # handle tpp env
+    if "Tpp-env" not in config['WinOLPC_Util']:
+        config['WinOLPC_Util']['Tpp-env'] = ''
+
+    return robotiniInfo(
+        robot=config['WinOLPC_Util']['Robot'],
+        version=config['WinOLPC_Util']['Version'],
+        base_path=config['WinOLPC_Util']['Base_Path'],
+        version_path=config['WinOLPC_Util']['Path'],
+        support=config['WinOLPC_Util']['Support'],
+        output=config['WinOLPC_Util']['Output'],
+        ftp=config['WinOLPC_Util']['Ftp'],
+        env=config['WinOLPC_Util']['Tpp-env'])
+
+
+#Class to represent a graph 
+class Graph:
+
+    def __init__(self, root=None, version=None): 
+        self.graph = collections.defaultdict(list) #dictionary containing adjacency List
+        self.root = []
+        if root is not None and version is not None:
+            self.root.append(self.addPackage(root, version, True))
+
+    def __getitem__(self, key):
+        for next in self.root:
+            if next.name == key:
+                return next
+
+    def print_dependencies(self, rootname):
+        depList = ''
+        
+        stack = self.depthFirstSearch(rootname)
+        depList += '<{}> {} {x}\n'.format(rootname, self[rootname].version, x='*' if self[rootname].inSource else '')
+        stack.remove(rootname)
+
+        for next in self.graph[rootname]:
+            depList = self.depPrintRec(next, stack, '|-- ', depList)
+
+        return depList
+
+    def depPrintRec(self, pkg, stack, prepStr, outstr):
+        if pkg.name in stack:
+            outstr += prepStr + '<{}> {} {x}\n'.format(pkg.name, pkg.version, x='*' if pkg.inSource else '')
+            stack.remove(pkg.name)
+
+        for next in self.graph[pkg.name]:
+            if next.name in stack:
+                outstr = self.depPrintRec(next, stack, '|   ' + prepStr, outstr)
+
+        return outstr
+
+  
+    def addPackage(self, Name, Version, Source):
+        return packages(
+                name= Name,
+                version= Version,
+                inSource= Source)
+
+    def setRoot(self, name, version):
+        self.root.append(self.addPackage(name, version, True))
+
+    # function to add an edge to graph 
+    def addEdge(self, pNode, cNode, version, isSource):
+        self.graph[pNode].append(self.addPackage(cNode, version, isSource))
+
+    def depthFirstSearch(self, start, visited=None, stack=None):
+        if visited is None:
+            visited = set()
+        if stack is None:
+            stack = []
+            
+        stack.append(start)
+        visited.add(start)
+        
+        pkg_names = set([p.name for p in self.graph[start]])
+
+        difference = pkg_names - visited
+        for next in difference:
+            self.depthFirstSearch(next,visited, stack)
+        
+        return stack
+
+
+def graph_tests():
+    g= Graph()
+    g.setRoot("Hash", '1.0.0')
+    g.addEdge("Hash", "kUnit", '0.0.1', True)
+    g.addEdge("Hash", "Strings", '0.0.2', True)
+    g.addEdge("Strings", "errors", '0.0.3', False) 
+    g.addEdge("Strings", "kUnit", '0.0.4', True)
+    g.addEdge("kUnit", "Strings", '0.0.2', True)
+    g.addEdge("errors", "registers", '0.0.1', False)
+    g.addEdge("errors", "kUnit", '0.0.4', True)
+
+    g.setRoot("ioFile", '1.0.0')
+    g.addEdge("ioFile", "Strings", '0.0.2', True)
+
+
+    # depth first search hierarchy
+    dep = g.depthFirstSearch("Hash")
+    print(dep)
+    dep = g.depthFirstSearch("ioFile")
+    print(dep)
+    # Print dependency graph
+    print(g.print_dependencies("Hash"))
+    print(g.print_dependencies("ioFile"))
 
 
 if __name__ == '__main__':
